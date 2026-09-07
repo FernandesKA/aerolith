@@ -14,6 +14,20 @@
 
 namespace aerolith {
 
+Rotation NextRotation(Rotation rotation) {
+  switch (rotation) {
+    case Rotation::kRotate0:
+      return Rotation::kRotate90;
+    case Rotation::kRotate90:
+      return Rotation::kRotate180;
+    case Rotation::kRotate180:
+      return Rotation::kRotate270;
+    case Rotation::kRotate270:
+      return Rotation::kRotate0;
+  }
+  return Rotation::kRotate0;
+}
+
 FrameBuffer::FrameBuffer(const std::string &path) {
   fd_ = open(path.c_str(), O_RDWR);
   if (fd_ < 0) {
@@ -50,6 +64,40 @@ FrameBuffer::FrameBuffer(const std::string &path) {
 
 FrameBuffer::~FrameBuffer() { close(fd_); }
 
+int FrameBuffer::xres() const {
+  const bool swapped =
+      rotation_ == Rotation::kRotate90 || rotation_ == Rotation::kRotate270;
+  return swapped ? yres_ : xres_;
+}
+
+int FrameBuffer::yres() const {
+  const bool swapped =
+      rotation_ == Rotation::kRotate90 || rotation_ == Rotation::kRotate270;
+  return swapped ? xres_ : yres_;
+}
+
+bool FrameBuffer::MapToPhysical(int lx, int ly, int *px, int *py) const {
+  switch (rotation_) {
+    case Rotation::kRotate0:
+      *px = lx;
+      *py = ly;
+      break;
+    case Rotation::kRotate90:
+      *px = xres_ - 1 - ly;
+      *py = lx;
+      break;
+    case Rotation::kRotate180:
+      *px = xres_ - 1 - lx;
+      *py = yres_ - 1 - ly;
+      break;
+    case Rotation::kRotate270:
+      *px = ly;
+      *py = yres_ - 1 - lx;
+      break;
+  }
+  return *px >= 0 && *px < xres_ && *py >= 0 && *py < yres_;
+}
+
 void FrameBuffer::Pack(Color color, uint8_t *out) const {
   const uint32_t value =
       ((static_cast<uint32_t>(color.r) >> (8 - r_len_)) << r_off_) |
@@ -75,21 +123,39 @@ void FrameBuffer::Clear(Color color) {
 void FrameBuffer::FillRect(int x, int y, int w, int h, Color color) {
   const int x0 = std::max(x, 0);
   const int y0 = std::max(y, 0);
-  const int x1 = std::min(x + w, xres_);
-  const int y1 = std::min(y + h, yres_);
+  const int x1 = std::min(x + w, xres());
+  const int y1 = std::min(y + h, yres());
   if (x1 <= x0 || y1 <= y0) {
     return;
   }
-  std::vector<uint8_t> pixel(bytes_per_pixel_);
-  Pack(color, pixel.data());
-  std::vector<uint8_t> row(static_cast<size_t>(x1 - x0) * bytes_per_pixel_);
-  for (int x_i = x0; x_i < x1; ++x_i) {
-    std::memcpy(&row[static_cast<size_t>(x_i - x0) * bytes_per_pixel_], pixel.data(),
-                bytes_per_pixel_);
+  if (rotation_ == Rotation::kRotate0) {
+    // Fast path: logical and physical layout coincide, so rows are
+    // contiguous and can be memcpy'd instead of set pixel-by-pixel.
+    std::vector<uint8_t> pixel(bytes_per_pixel_);
+    Pack(color, pixel.data());
+    std::vector<uint8_t> row(static_cast<size_t>(x1 - x0) * bytes_per_pixel_);
+    for (int x_i = x0; x_i < x1; ++x_i) {
+      std::memcpy(&row[static_cast<size_t>(x_i - x0) * bytes_per_pixel_], pixel.data(),
+                  bytes_per_pixel_);
+    }
+    const int start = x0 * bytes_per_pixel_;
+    for (int py = y0; py < y1; ++py) {
+      std::memcpy(&canvas_[static_cast<size_t>(py) * stride_ + start], row.data(), row.size());
+    }
+    return;
   }
-  const int start = x0 * bytes_per_pixel_;
-  for (int py = y0; py < y1; ++py) {
-    std::memcpy(&canvas_[static_cast<size_t>(py) * stride_ + start], row.data(), row.size());
+
+  uint8_t pixel[4];
+  Pack(color, pixel);
+  for (int ly = y0; ly < y1; ++ly) {
+    for (int lx = x0; lx < x1; ++lx) {
+      int px = 0, py = 0;
+      if (MapToPhysical(lx, ly, &px, &py)) {
+        std::memcpy(&canvas_[static_cast<size_t>(py) * stride_ +
+                              static_cast<size_t>(px) * bytes_per_pixel_],
+                    pixel, bytes_per_pixel_);
+      }
+    }
   }
 }
 
@@ -120,7 +186,7 @@ int FrameBuffer::TextWidth(const std::string &text, int scale) const {
 
 int FrameBuffer::DrawTextCentered(int y, const std::string &text, Color color, int scale,
                                    std::optional<Color> bg, std::optional<int> center_x) {
-  const int cx = center_x.value_or(xres_ / 2);
+  const int cx = center_x.value_or(xres() / 2);
   const int x = cx - TextWidth(text, scale) / 2;
   return DrawText(x, y, text, color, scale, bg);
 }

@@ -47,8 +47,9 @@ offset 16, green offset 8, blue offset 0, 8 bits each.
 ```
 include/aerolith/
   scd41.hpp         # IIO sysfs -> Reading{co2_ppm, temperature_c, humidity_rh}
-  framebuffer.hpp   # /dev/fb0 access + 5x7 text/rect drawing
+  framebuffer.hpp   # /dev/fb0 access + 5x7 text/rect drawing + rotation
   font5x7.hpp       # hand-drawn bitmap font
+  touch.hpp         # evdev touchscreen -> short-tap-in-center detection
 src/                # matching .cpp implementations + main.cpp (CLI entry point)
 cmake/toolchain-riscv64-m1s.cmake
 buildroot/
@@ -95,8 +96,22 @@ ssh root@<board-ip> /usr/bin/aerolith --once   # single frame, to try it
 ```
 
 Flags: `--fb DEV` (default `/dev/fb0`), `--iio-path PATH` (auto-detected
-otherwise), `--interval SECONDS` (default 5), `--once` (render a single
-frame and exit).
+otherwise), `--touch-path PATH` (default `/dev/input/event0`), `--interval
+SECONDS` (default 5), `--once` (render a single frame and exit).
+
+### Rotating the display via touch
+
+The board's onboard CST816x touchscreen (`/dev/input/event0`) is polled
+continuously: a short tap (pressed and released within 400ms, without
+dragging) near the center of the touch surface rotates the display 90°
+clockwise, cycling 0° -> 90° -> 180° -> 270° -> 0° ... Rendering is done
+in a logical coordinate space that swaps width/height at 90°/270° and is
+then mapped onto the panel's fixed physical pixel layout
+(`FrameBuffer::SetRotation`/`Rotation` in
+[framebuffer.hpp](include/aerolith/framebuffer.hpp)), so drawing code
+doesn't need to know about the current orientation. If no touch device is
+present (or `--touch-path` points at nothing), this feature is silently
+unavailable and the app otherwise runs as normal.
 
 To auto-start at boot without a full package build, install the init
 script directly:

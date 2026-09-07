@@ -14,6 +14,7 @@ add_executable(aerolith
   src/framebuffer.cpp
   src/scd41.cpp
   src/font5x7.cpp
+  src/touch.cpp
 )
 
 target_include_directories(aerolith PRIVATE include)

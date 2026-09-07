@@ -6,6 +6,9 @@
 #include "aerolith/font5x7.hpp"
 #include "aerolith/framebuffer.hpp"
 #include "aerolith/scd41.hpp"
+#include "aerolith/touch.hpp"
+
+#include <poll.h>
 
 #include <chrono>
 #include <csignal>
@@ -15,6 +18,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -22,8 +26,10 @@ namespace {
 
 using aerolith::Color;
 using aerolith::FrameBuffer;
+using aerolith::NextRotation;
 using aerolith::Reading;
 using aerolith::SCD41;
+using aerolith::TouchInput;
 
 constexpr Color kWhite{255, 255, 255};
 constexpr Color kBlack{0, 0, 0};
@@ -84,17 +90,21 @@ void Render(FrameBuffer &fb, const Reading *reading, const char *error) {
 struct Args {
   std::string fb = "/dev/fb0";
   std::string iio_path;
+  std::string touch_path = "/dev/input/event0";
   double interval = 5.0;
   bool once = false;
 };
 
 void PrintUsage(const char *prog) {
   std::printf(
-      "Usage: %s [--fb DEV] [--iio-path PATH] [--interval SECONDS] [--once]\n"
+      "Usage: %s [--fb DEV] [--iio-path PATH] [--touch-path PATH] "
+      "[--interval SECONDS] [--once]\n"
       "\n"
       "  --fb DEV            framebuffer device (default: /dev/fb0)\n"
       "  --iio-path PATH     explicit /sys/bus/iio/devices/iio:deviceN path\n"
       "                      (auto-detected by driver name otherwise)\n"
+      "  --touch-path PATH   touchscreen evdev node (default: /dev/input/event0);\n"
+      "                      a short tap near the center rotates the display\n"
       "  --interval SECONDS  seconds between reads (default: 5.0)\n"
       "  --once              read and render a single frame, then exit\n",
       prog);
@@ -114,6 +124,8 @@ bool ParseArgs(int argc, char **argv, Args *args) {
       args->fb = next_value("--fb");
     } else if (arg == "--iio-path") {
       args->iio_path = next_value("--iio-path");
+    } else if (arg == "--touch-path") {
+      args->touch_path = next_value("--touch-path");
     } else if (arg == "--interval") {
       args->interval = std::atof(next_value("--interval"));
     } else if (arg == "--once") {
@@ -148,22 +160,40 @@ int main(int argc, char **argv) {
   SCD41 sensor(args.iio_path);
 
   FrameBuffer fb(args.fb);
+  TouchInput touch(args.touch_path);
+
+  std::optional<Reading> last_reading;
+  std::string last_error;
+  auto RenderCurrent = [&] {
+    Render(fb, last_reading ? &*last_reading : nullptr,
+           last_reading ? nullptr : last_error.c_str());
+  };
 
   while (g_running) {
     try {
-      const Reading reading = sensor.Read();
-      Render(fb, &reading, nullptr);
+      last_reading = sensor.Read();
     } catch (const std::exception &exc) {
       std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
-      Render(fb, nullptr, exc.what());
+      last_reading.reset();
+      last_error = exc.what();
     }
+    RenderCurrent();
 
     if (args.once) {
       break;
     }
     const int ticks = static_cast<int>(args.interval * 10);
     for (int i = 0; i < ticks && g_running; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      if (!touch.valid()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        continue;
+      }
+      pollfd pfd{touch.fd(), POLLIN, 0};
+      const int ret = poll(&pfd, 1, 100);
+      if (ret > 0 && (pfd.revents & POLLIN) && touch.PollShortCenterTap()) {
+        fb.SetRotation(NextRotation(fb.rotation()));
+        RenderCurrent();
+      }
     }
   }
 

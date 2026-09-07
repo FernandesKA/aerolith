@@ -16,6 +16,13 @@ struct Color {
   uint8_t r, g, b;
 };
 
+// A quarter-turn rotation applied between the logical drawing coordinate
+// space (what FillRect/DrawText use) and the physical panel's fixed pixel
+// layout. Values are clockwise degrees the *content* is rotated by.
+enum class Rotation { kRotate0, kRotate90, kRotate180, kRotate270 };
+
+Rotation NextRotation(Rotation rotation);
+
 class FrameBuffer {
 public:
   explicit FrameBuffer(const std::string &path = "/dev/fb0");
@@ -39,8 +46,13 @@ public:
 
   void Flush();
 
-  int xres() const { return xres_; }
-  int yres() const { return yres_; }
+  void SetRotation(Rotation rotation) { rotation_ = rotation; }
+  Rotation rotation() const { return rotation_; }
+
+  // Logical drawing-space dimensions: swapped from the physical panel's
+  // when rotated a quarter turn (90/270).
+  int xres() const;
+  int yres() const;
 
 private:
   int fd_;
@@ -50,8 +62,12 @@ private:
   int stride_ = 0;
   uint32_t r_off_ = 0, r_len_ = 0, g_off_ = 0, g_len_ = 0, b_off_ = 0, b_len_ = 0;
   std::vector<uint8_t> canvas_;
+  Rotation rotation_ = Rotation::kRotate0;
 
   void Pack(Color color, uint8_t *out) const;
+  // Maps a logical drawing-space pixel to its physical location, honoring
+  // the current rotation. Returns false if it falls outside the panel.
+  bool MapToPhysical(int lx, int ly, int *px, int *py) const;
 };
 
 } // namespace aerolith
