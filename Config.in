@@ -1,0 +1,3 @@
+menu "aerolith"
+	source "$BR2_EXTERNAL_AEROLITH_PATH/package/aerolith/Config.in"
+endmenu

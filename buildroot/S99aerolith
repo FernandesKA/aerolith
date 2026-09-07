@@ -10,15 +10,12 @@
 
 NAME=aerolith
 PIDFILE=/var/run/$NAME.pid
-APP_DIR=/usr/local/lib/aerolith
-DAEMON=/usr/bin/python3
-DAEMON_ARGS="-m aerolith.main"
+DAEMON=/usr/bin/aerolith
 
 case "$1" in
   start)
     echo "Starting $NAME..."
-    PYTHONPATH="$APP_DIR" start-stop-daemon -S -q -m -b -p "$PIDFILE" \
-      -x "$DAEMON" -- $DAEMON_ARGS
+    start-stop-daemon -S -q -m -b -p "$PIDFILE" -x "$DAEMON"
     ;;
   stop)
     echo "Stopping $NAME..."

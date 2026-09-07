@@ -1,0 +1,15 @@
+config BR2_PACKAGE_AEROLITH
+	bool "aerolith"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	depends on BR2_USE_MMU # fork() via start-stop-daemon in the init script
+	help
+	  Reads a Sensirion SCD41 (CO2/temperature/humidity) sensor via the
+	  kernel's scd4x IIO sysfs attributes and renders the readings to a
+	  Linux framebuffer device (e.g. a MIPI-DBI display), such as the
+	  Sipeed M1S (Bouffalo Lab BL808) onboard display.
+
+	  https://github.com/FernandesKA/aerolith
+
+comment "aerolith needs a toolchain w/ C++, threads"
+	depends on !BR2_INSTALL_LIBSTDCPP || !BR2_TOOLCHAIN_HAS_THREADS

@@ -1,17 +1,19 @@
 # Aerolith
 
 Reads a Sensirion SCD41 (CO2 / temperature / humidity) and shows the
-readings on the Sipeed M1S's onboard 1.69" MIPI-DBI display.
+readings on a Linux framebuffer -- verified on the Sipeed M1S's onboard
+1.69" MIPI-DBI display.
 
 Target board: Sipeed M1S (Bouffalo Lab BL808), built from
 [FernandesKA/buildroot_custom](https://github.com/FernandesKA/buildroot_custom)
 using `sipeed_m1s_ext_defconfig`.
 
-## Why there's no C code or extra libraries
+C++17, cross-compiled with the `riscv64-buildroot-linux-gnu` SDK toolchain
+from that same buildroot_custom project (`BR2_INSTALL_LIBSTDCPP=y` provides
+`libstdc++.so.6` on the target rootfs, and the SDK provides
+`riscv64-unknown-linux-gnu-g++`).
 
-The defconfig ships no target C compiler and no Pillow/numpy, but it does
-build a full Python 3.14 for the target (confirmed live on the board), so
-this project is plain Python 3 stdlib only:
+## How it talks to the hardware
 
 - **Sensor**: the board's devicetree already declares the SCD41
   (`co2-sensor@62` on `i2c2`, address `0x62`, pins GPIO0_6/GPIO0_7), and the
@@ -22,11 +24,9 @@ this project is plain Python 3 stdlib only:
 - **Display**: the devicetree also declares a `panel-mipi-dbi-spi` display
   on `spi1`, which the kernel exposes as a standard Linux framebuffer at
   `/dev/fb0`. This project writes to it directly via `FBIOGET_VSCREENINFO`
-  + raw pixel writes, with its own tiny embedded 5x7 bitmap font (no
-  FreeType/Pillow available on target).
+  + raw pixel writes, with its own tiny embedded 5x7 bitmap font.
 
-Everything above was verified against a running board, not just read out
-of the defconfig:
+Verified against a running board:
 
 ```
 $ cat /sys/bus/iio/devices/iio:device0/name
@@ -45,58 +45,100 @@ offset 16, green offset 8, blue offset 0, 8 bits each.
 ## Layout
 
 ```
-aerolith/
-  scd41.py        # IIO sysfs -> Reading(co2_ppm, temperature_c, humidity_rh)
-  framebuffer.py  # /dev/fb0 access + 5x7 text/rect drawing
-  font5x7.py      # hand-drawn bitmap font (digits, A C E H I L M O P R T U, . - %)
-  main.py         # render loop, CLI entry point
+include/aerolith/
+  scd41.hpp         # IIO sysfs -> Reading{co2_ppm, temperature_c, humidity_rh}
+  framebuffer.hpp   # /dev/fb0 access + 5x7 text/rect drawing
+  font5x7.hpp       # hand-drawn bitmap font
+src/                # matching .cpp implementations + main.cpp (CLI entry point)
+cmake/toolchain-riscv64-m1s.cmake
 buildroot/
-  S99aerolith     # sysvinit-style init script (BusyBox init, matches this
-                  # board's /etc/init.d/S* convention)
+  S99aerolith       # sysvinit-style init script (BusyBox init)
+package/aerolith/
+  Config.in         # Buildroot menuconfig entry
+  aerolith.mk       # Buildroot package build/install rules
+external.desc, external.mk, Config.in   # BR2_EXTERNAL tree root files
 ```
 
-## Running it on the board
+## Building manually
 
-The board runs a Buildroot rootfs (BusyBox init, dropbear SSH, no systemd,
-47MB RAM total -- keep it lightweight).
+```
+cmake -B build \
+  -DCMAKE_TOOLCHAIN_FILE=cmake/toolchain-riscv64-m1s.cmake \
+  -DTOOLCHAIN_ROOT=/path/to/riscv64-buildroot-linux-gnu_sdk-buildroot
+cmake --build build -- -j$(nproc)
+```
 
-1. Copy the `aerolith/` package to the board, e.g. over the network
-   (dropbear/SSH is enabled: `S50dropbear`):
+`TOOLCHAIN_ROOT` can also be set via the `AEROLITH_TOOLCHAIN_ROOT`
+environment variable instead of `-D` (needed because CMake's compiler-ABI
+`try_compile` step doesn't forward arbitrary `-D` cache variables).
 
-   ```
-   scp -r aerolith root@<board-ip>:/usr/local/lib/aerolith
-   ```
+This produces `build/aerolith`, a dynamically-linked riscv64 ELF binary
+(needs `libstdc++.so.6`, `libm.so.6`, `libgcc_s.so.1`, `libc.so.6` --
+all already present in the buildroot_custom target rootfs).
 
-   Or, with no network available yet, copy it in over the serial console
-   (`/dev/ttyACM2` at 2000000 baud per the board's `stdout-path` /
-   bootargs) using any base64-paste-and-decode approach, since there's no
-   file transfer protocol over a plain serial line here.
+Sanity-check the binary without hardware using `qemu-user`:
 
-2. Run it directly to try it out:
+```
+qemu-riscv64-static -L /path/to/toolchain/riscv64-buildroot-linux-gnu/sysroot \
+  build/aerolith --help
+```
 
-   ```
-   cd /usr/local/lib && python3 -m aerolith.main
-   ```
+(`--once`/normal runs will still fail under qemu since there's no real
+`/sys/bus/iio` SCD41 device or `/dev/fb0` framebuffer on the host -- that
+part can only be verified on the actual board.)
 
-   Useful flags: `--interval SECONDS` (default 5, matching the SCD41's own
-   update cadence), `--once` (render a single frame and exit, handy for
-   testing), `--fb /dev/fbN`, `--iio-path /sys/bus/iio/devices/iio:deviceN`
-   (only needed if auto-detection by driver name picks the wrong device).
+### Running it on the board
 
-3. To start it automatically at boot, install the init script:
+```
+scp build/aerolith root@<board-ip>:/usr/bin/aerolith
+ssh root@<board-ip> /usr/bin/aerolith --once   # single frame, to try it
+```
 
-   ```
-   cp buildroot/S99aerolith /etc/init.d/S99aerolith
-   chmod +x /etc/init.d/S99aerolith
-   /etc/init.d/S99aerolith start
-   ```
+Flags: `--fb DEV` (default `/dev/fb0`), `--iio-path PATH` (auto-detected
+otherwise), `--interval SECONDS` (default 5), `--once` (render a single
+frame and exit).
 
-   To bake this into the image permanently instead, add both
-   `aerolith/` (under `/usr/local/lib/aerolith`) and `S99aerolith` to
-   `buildroot_external/board/sipeed/m1s/rootfs-overlay/` in
-   `buildroot_custom` (the same overlay that already ships
-   `S01growfs` etc.), so `BR2_ROOTFS_OVERLAY` picks them up on the next
-   image build.
+To auto-start at boot without a full package build, install the init
+script directly:
+
+```
+cp buildroot/S99aerolith /etc/init.d/S99aerolith
+chmod +x /etc/init.d/S99aerolith
+/etc/init.d/S99aerolith start
+```
+
+## Buildroot package integration
+
+This repo is a self-contained [`BR2_EXTERNAL`](https://buildroot.org/downloads/manual/manual.html#outside-br-custom)
+tree, so it can be built into a Buildroot image without copying any files
+into `buildroot_custom`:
+
+```
+cd /path/to/buildroot_custom
+make BR2_EXTERNAL=/path/to/aerolith sipeed_m1s_ext_defconfig
+make menuconfig    # enable "aerolith" under External options -> aerolith
+make
+```
+
+(If you already pass other `BR2_EXTERNAL` trees, Buildroot accepts a
+colon-separated list, or accumulates them from a prior invocation via
+`.br-external.conf` in the output directory.)
+
+Enabling `BR2_PACKAGE_AEROLITH`:
+
+- fetches this repo (see `AEROLITH_VERSION`/`AEROLITH_SITE` in
+  [package/aerolith/aerolith.mk](package/aerolith/aerolith.mk) -- pin this
+  to a tag/commit once one exists, instead of tracking `main`),
+- builds it with the target CMake toolchain via Buildroot's
+  `cmake-package` infrastructure,
+- installs the binary to `/usr/bin/aerolith` on the target,
+- and installs `buildroot/S99aerolith` to `/etc/init.d/S99aerolith` so it
+  starts automatically (BusyBox/sysvinit style).
+
+For local package development, use Buildroot's package override
+mechanism (`BR2_PACKAGE_AEROLITH_OVERRIDE_SRCDIR` in a
+`local.mk`/override file, or `make aerolith-rebuild`) to point it at a
+local working copy instead of re-fetching from GitHub each time.
 
 ## A note on the serial console port
 
