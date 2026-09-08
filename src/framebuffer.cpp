@@ -76,6 +76,16 @@ int FrameBuffer::yres() const {
   return swapped ? xres_ : yres_;
 }
 
+namespace {
+// Never fully off -- a completely black screen at the dim end of the drag
+// would look indistinguishable from the app having frozen or crashed.
+constexpr double kMinBrightness = 0.05;
+} // namespace
+
+void FrameBuffer::SetBrightness(double brightness) {
+  brightness_ = std::clamp(brightness, kMinBrightness, 1.0);
+}
+
 bool FrameBuffer::MapToPhysical(int lx, int ly, int *px, int *py) const {
   switch (rotation_) {
     case Rotation::kRotate0:
@@ -99,10 +109,12 @@ bool FrameBuffer::MapToPhysical(int lx, int ly, int *px, int *py) const {
 }
 
 void FrameBuffer::Pack(Color color, uint8_t *out) const {
-  const uint32_t value =
-      ((static_cast<uint32_t>(color.r) >> (8 - r_len_)) << r_off_) |
-      ((static_cast<uint32_t>(color.g) >> (8 - g_len_)) << g_off_) |
-      ((static_cast<uint32_t>(color.b) >> (8 - b_len_)) << b_off_);
+  auto scale = [this](uint8_t component) -> uint32_t {
+    return static_cast<uint32_t>(component * brightness_ + 0.5);
+  };
+  const uint32_t value = ((scale(color.r) >> (8 - r_len_)) << r_off_) |
+                          ((scale(color.g) >> (8 - g_len_)) << g_off_) |
+                          ((scale(color.b) >> (8 - b_len_)) << b_off_);
   for (int i = 0; i < bytes_per_pixel_; ++i) {
     out[i] = static_cast<uint8_t>((value >> (8 * i)) & 0xFF);
   }

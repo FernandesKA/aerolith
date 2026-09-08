@@ -49,6 +49,15 @@ bool TouchInput::InCenterZone(int32_t x, int32_t y) const {
          y <= y_max_ - y_margin;
 }
 
+bool TouchInput::NormalizedPosition(double *fx, double *fy) const {
+  if (!touching_ || !have_abs_range_) {
+    return false;
+  }
+  *fx = static_cast<double>(cur_x_ - x_min_) / (x_max_ - x_min_);
+  *fy = static_cast<double>(cur_y_ - y_min_) / (y_max_ - y_min_);
+  return true;
+}
+
 TouchEvent TouchInput::Poll() {
   if (fd_ < 0) {
     return TouchEvent::kNone;

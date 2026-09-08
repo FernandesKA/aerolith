@@ -54,6 +54,13 @@ public:
   int xres() const;
   int yres() const;
 
+  // Software brightness: scales every drawn color before it's packed into
+  // a pixel. The panel's own backlight is a plain on/off GPIO (no PWM), so
+  // this is the only dimming available. Clamped away from 0 so the screen
+  // never looks powered off. 1.0 (full brightness) by default.
+  void SetBrightness(double brightness);
+  double brightness() const { return brightness_; }
+
 private:
   int fd_;
   int xres_ = 0, yres_ = 0, xres_virtual_ = 0, yres_virtual_ = 0;
@@ -63,6 +70,7 @@ private:
   uint32_t r_off_ = 0, r_len_ = 0, g_off_ = 0, g_len_ = 0, b_off_ = 0, b_len_ = 0;
   std::vector<uint8_t> canvas_;
   Rotation rotation_ = Rotation::kRotate0;
+  double brightness_ = 1.0;
 
   void Pack(Color color, uint8_t *out) const;
   // Maps a logical drawing-space pixel to its physical location, honoring

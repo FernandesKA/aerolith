@@ -48,6 +48,11 @@ constexpr auto kPomodoroDuration = std::chrono::minutes(25);
 // the last good reading until it's been this long since it was current.
 constexpr auto kStaleGracePeriod = std::chrono::minutes(3);
 
+// Rightmost slice of the screen (in current-rotation logical space) that
+// starts a brightness drag; kept well clear of TouchInput's own center
+// zone so the two gestures never both claim the same touch.
+constexpr double kBrightnessEdgeZone = 0.85;
+
 // CO2 thresholds (ppm) -> background color, roughly following common
 // indoor air quality guidance (EN 13779 / REHVA).
 struct CO2Level {
@@ -293,6 +298,7 @@ int main(int argc, char **argv) {
   PomodoroState pomo_state = PomodoroState::kIdle;
   std::chrono::steady_clock::time_point pomo_deadline;
   long last_rendered_pomo_seconds = -1;
+  bool brightness_dragging = false;
 
   auto RenderCurrent = [&] {
     if (pomo_state == PomodoroState::kIdle) {
@@ -396,6 +402,36 @@ int main(int argc, char **argv) {
           break;
         case TouchEvent::kNone:
           break;
+      }
+
+      // Brightness slider: dragging in the rightmost strip of the *physical*
+      // panel sets the level directly from finger height, like a physical
+      // fader -- top of the strip is full brightness, bottom is dimmest.
+      // Deliberately NOT rotation-aware: the device sits in one fixed
+      // physical position and SetRotation just picks how the content reads
+      // from there, so a hand reaching for "the edge of the screen" always
+      // reaches for the same physical spot regardless of the current
+      // rotation. Starting a drag anywhere else never engages it, and
+      // lifting the finger or leaving the panel disengages it, so it can't
+      // be triggered by the center tap/long-press gestures above.
+      double fx = 0.0, fy = 0.0;
+      if (touch.Touching() && touch.NormalizedPosition(&fx, &fy)) {
+        if (std::getenv("AEROLITH_DEBUG_TOUCH") != nullptr) {
+          std::fprintf(stderr, "touch: raw=(%.3f,%.3f) dragging=%d\n", fx, fy,
+                       brightness_dragging);
+        }
+        if (!brightness_dragging && fx >= kBrightnessEdgeZone) {
+          brightness_dragging = true;
+        }
+        if (brightness_dragging) {
+          const double level = 1.0 - fy;
+          if (std::abs(level - fb.brightness()) > 0.01) {
+            fb.SetBrightness(level);
+            RenderCurrent();
+          }
+        }
+      } else {
+        brightness_dragging = false;
       }
     } else {
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
