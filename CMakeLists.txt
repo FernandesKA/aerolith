@@ -20,4 +20,13 @@ add_executable(aerolith
 target_include_directories(aerolith PRIVATE include)
 target_compile_options(aerolith PRIVATE -Wall -Wextra)
 
+find_package(Threads REQUIRED)
+target_link_libraries(aerolith PRIVATE Threads::Threads)
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+  # This riscv64 toolchain doesn't inline single-byte atomic ops; std::atomic<bool>
+  # pulls in libatomic for __atomic_exchange_1 and friends.
+  target_link_libraries(aerolith PRIVATE atomic)
+endif()
+
 install(TARGETS aerolith RUNTIME DESTINATION bin)

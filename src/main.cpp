@@ -10,6 +10,8 @@
 
 #include <poll.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
@@ -18,6 +20,7 @@
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -29,10 +32,14 @@ using aerolith::FrameBuffer;
 using aerolith::NextRotation;
 using aerolith::Reading;
 using aerolith::SCD41;
+using aerolith::TouchEvent;
 using aerolith::TouchInput;
 
 constexpr Color kWhite{255, 255, 255};
 constexpr Color kBlack{0, 0, 0};
+
+enum class PomodoroState { kIdle, kRunning, kFinished };
+constexpr auto kPomodoroDuration = std::chrono::minutes(25);
 
 // CO2 thresholds (ppm) -> background color, roughly following common
 // indoor air quality guidance (EN 13779 / REHVA).
@@ -87,6 +94,25 @@ void Render(FrameBuffer &fb, const Reading *reading, const char *error) {
   fb.Flush();
 }
 
+void RenderPomodoro(FrameBuffer &fb, PomodoroState state, std::chrono::seconds remaining) {
+  fb.Clear(kBlack);
+  fb.DrawTextCentered(6, "POMODORO", kWhite, 2);
+
+  if (state == PomodoroState::kFinished) {
+    fb.FillRect(0, 30, fb.xres(), 90, Color{150, 20, 20});
+    fb.DrawTextCentered(45, "DONE", kWhite, 6);
+    fb.Flush();
+    return;
+  }
+
+  fb.FillRect(0, 30, fb.xres(), 90, Color{190, 70, 30});
+  const int total_seconds = static_cast<int>(std::max<long>(remaining.count(), 0) % 3600);
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%02d:%02d", total_seconds / 60, total_seconds % 60);
+  fb.DrawTextCentered(45, buf, kWhite, 6);
+  fb.Flush();
+}
+
 struct Args {
   std::string fb = "/dev/fb0";
   std::string iio_path;
@@ -104,7 +130,8 @@ void PrintUsage(const char *prog) {
       "  --iio-path PATH     explicit /sys/bus/iio/devices/iio:deviceN path\n"
       "                      (auto-detected by driver name otherwise)\n"
       "  --touch-path PATH   touchscreen evdev node (default: /dev/input/event0);\n"
-      "                      a short tap near the center rotates the display\n"
+      "                      a short tap near the center rotates the display,\n"
+      "                      a long press starts/cancels a 25-minute Pomodoro timer\n"
       "  --interval SECONDS  seconds between reads (default: 5.0)\n"
       "  --once              read and render a single frame, then exit\n",
       prog);
@@ -164,38 +191,129 @@ int main(int argc, char **argv) {
 
   std::optional<Reading> last_reading;
   std::string last_error;
+  PomodoroState pomo_state = PomodoroState::kIdle;
+  std::chrono::steady_clock::time_point pomo_deadline;
+  long last_rendered_pomo_seconds = -1;
+
   auto RenderCurrent = [&] {
-    Render(fb, last_reading ? &*last_reading : nullptr,
-           last_reading ? nullptr : last_error.c_str());
+    if (pomo_state == PomodoroState::kIdle) {
+      Render(fb, last_reading ? &*last_reading : nullptr,
+             last_reading ? nullptr : last_error.c_str());
+      return;
+    }
+    const auto remaining = pomo_state == PomodoroState::kRunning
+                                ? std::chrono::duration_cast<std::chrono::seconds>(
+                                      pomo_deadline - std::chrono::steady_clock::now())
+                                : std::chrono::seconds(0);
+    RenderPomodoro(fb, pomo_state, remaining);
   };
 
-  while (g_running) {
+  auto ReadSensor = [&] {
     try {
       last_reading = sensor.Read();
+      last_error.clear();
     } catch (const std::exception &exc) {
       std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
       last_reading.reset();
       last_error = exc.what();
     }
-    RenderCurrent();
+  };
 
-    if (args.once) {
-      break;
-    }
-    const int ticks = static_cast<int>(args.interval * 10);
-    for (int i = 0; i < ticks && g_running; ++i) {
-      if (!touch.valid()) {
+  ReadSensor();
+  RenderCurrent();
+
+  if (args.once) {
+    fb.Clear(kBlack);
+    fb.Flush();
+    return 0;
+  }
+
+  // The SCD41 IIO driver re-triggers a fresh multi-second measurement on
+  // every raw-attribute read, so a single Reading() can block for 15-30s.
+  // Doing that on the main thread would freeze touch polling and rendering
+  // for the whole span, so it runs on its own thread; the two threads only
+  // communicate through reading_mutex-guarded state below.
+  std::mutex reading_mutex;
+  std::optional<Reading> shared_reading = last_reading;
+  std::string shared_error = last_error;
+  std::atomic<bool> reading_dirty{false};
+
+  std::thread sensor_thread([&] {
+    while (g_running) {
+      for (int i = 0; i < static_cast<int>(args.interval * 10) && g_running; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        continue;
       }
+      if (!g_running) {
+        break;
+      }
+      std::optional<Reading> reading;
+      std::string error;
+      try {
+        reading = sensor.Read();
+      } catch (const std::exception &exc) {
+        std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
+        error = exc.what();
+      }
+      {
+        std::lock_guard<std::mutex> lock(reading_mutex);
+        shared_reading = reading;
+        shared_error = error;
+      }
+      reading_dirty = true;
+    }
+  });
+
+  while (g_running) {
+    if (touch.valid()) {
       pollfd pfd{touch.fd(), POLLIN, 0};
-      const int ret = poll(&pfd, 1, 100);
-      if (ret > 0 && (pfd.revents & POLLIN) && touch.PollShortCenterTap()) {
-        fb.SetRotation(NextRotation(fb.rotation()));
+      poll(&pfd, 1, 100);
+      switch (touch.Poll()) {
+        case TouchEvent::kShortTap:
+          fb.SetRotation(NextRotation(fb.rotation()));
+          RenderCurrent();
+          break;
+        case TouchEvent::kLongPress:
+          pomo_state = pomo_state == PomodoroState::kIdle ? PomodoroState::kRunning
+                                                            : PomodoroState::kIdle;
+          if (pomo_state == PomodoroState::kRunning) {
+            pomo_deadline = std::chrono::steady_clock::now() + kPomodoroDuration;
+          }
+          last_rendered_pomo_seconds = -1;
+          RenderCurrent();
+          break;
+        case TouchEvent::kNone:
+          break;
+      }
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    if (reading_dirty.exchange(false)) {
+      {
+        std::lock_guard<std::mutex> lock(reading_mutex);
+        last_reading = shared_reading;
+        last_error = shared_error;
+      }
+      if (pomo_state == PomodoroState::kIdle) {
+        RenderCurrent();
+      }
+    }
+
+    if (pomo_state == PomodoroState::kRunning) {
+      const auto remaining = std::chrono::duration_cast<std::chrono::seconds>(
+          pomo_deadline - std::chrono::steady_clock::now());
+      if (remaining.count() <= 0) {
+        pomo_state = PomodoroState::kFinished;
+        last_rendered_pomo_seconds = -1;
+        RenderCurrent();
+      } else if (remaining.count() != last_rendered_pomo_seconds) {
+        last_rendered_pomo_seconds = remaining.count();
         RenderCurrent();
       }
     }
   }
+
+  sensor_thread.join();
 
   fb.Clear(kBlack);
   fb.Flush();

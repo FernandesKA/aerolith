@@ -8,8 +8,9 @@
 namespace aerolith {
 
 namespace {
-constexpr int64_t kMaxTapDurationUs = 400000; // 400ms: press+release, not a long-press
-constexpr double kCenterZoneFraction = 0.6;   // require the tap within the middle 60%
+constexpr auto kMaxTapDuration = std::chrono::milliseconds(400); // press+release, not a long-press
+constexpr auto kLongPressThreshold = std::chrono::milliseconds(900);
+constexpr double kCenterZoneFraction = 0.6; // require the gesture within the middle 60%
 } // namespace
 
 TouchInput::TouchInput(const std::string &path) {
@@ -48,16 +49,14 @@ bool TouchInput::InCenterZone(int32_t x, int32_t y) const {
          y <= y_max_ - y_margin;
 }
 
-bool TouchInput::PollShortCenterTap() {
+TouchEvent TouchInput::Poll() {
   if (fd_ < 0) {
-    return false;
+    return TouchEvent::kNone;
   }
 
-  bool tap_detected = false;
+  TouchEvent result = TouchEvent::kNone;
   input_event ev{};
   while (read(fd_, &ev, sizeof(ev)) == static_cast<ssize_t>(sizeof(ev))) {
-    const int64_t event_us = static_cast<int64_t>(ev.time.tv_sec) * 1000000 + ev.time.tv_usec;
-
     if (ev.type == EV_ABS) {
       if (ev.code == ABS_X) {
         cur_x_ = ev.value;
@@ -70,18 +69,28 @@ bool TouchInput::PollShortCenterTap() {
     } else if (ev.type == EV_KEY && ev.code == BTN_TOUCH) {
       if (ev.value == 1) {
         touching_ = true;
-        down_time_us_ = event_us;
+        long_press_fired_ = false;
+        down_time_ = std::chrono::steady_clock::now();
         in_center_ = InCenterZone(cur_x_, cur_y_);
       } else if (ev.value == 0 && touching_) {
         touching_ = false;
-        const int64_t duration_us = event_us - down_time_us_;
-        if (in_center_ && duration_us >= 0 && duration_us <= kMaxTapDurationUs) {
-          tap_detected = true;
+        const auto duration = std::chrono::steady_clock::now() - down_time_;
+        if (!long_press_fired_ && in_center_ && duration <= kMaxTapDuration) {
+          result = TouchEvent::kShortTap;
         }
       }
     }
   }
-  return tap_detected;
+
+  // Checked independently of new events: a perfectly still hold may stop
+  // generating fresh reports, but the press should still be recognized.
+  if (touching_ && in_center_ && !long_press_fired_ &&
+      std::chrono::steady_clock::now() - down_time_ >= kLongPressThreshold) {
+    long_press_fired_ = true;
+    result = TouchEvent::kLongPress;
+  }
+
+  return result;
 }
 
 } // namespace aerolith
