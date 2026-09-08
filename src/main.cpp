@@ -11,12 +11,14 @@
 #include <poll.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -41,6 +43,11 @@ constexpr Color kBlack{0, 0, 0};
 enum class PomodoroState { kIdle, kRunning, kFinished };
 constexpr auto kPomodoroDuration = std::chrono::minutes(25);
 
+// A transient sensor read failure (I2C hiccup, single-shot measurement
+// glitch) shouldn't flip the whole screen to an error state -- keep showing
+// the last good reading until it's been this long since it was current.
+constexpr auto kStaleGracePeriod = std::chrono::minutes(3);
+
 // CO2 thresholds (ppm) -> background color, roughly following common
 // indoor air quality guidance (EN 13779 / REHVA).
 struct CO2Level {
@@ -64,7 +71,91 @@ Color StatusColor(double co2_ppm) {
   return kCO2Levels[std::size(kCO2Levels) - 1].color;
 }
 
-void Render(FrameBuffer &fb, const Reading *reading, const char *error) {
+struct CO2Sample {
+  std::chrono::steady_clock::time_point time;
+  double co2_ppm;
+};
+
+constexpr auto kHistoryWindow = std::chrono::hours(1);
+constexpr int kGraphBuckets = 60; // one per minute over the window
+
+// Bucketed bar graph of the last hour of CO2 readings, drawn under the rest
+// of the main screen. Buckets with no sample in them (sensor read failed,
+// or the app just started) are left blank rather than interpolated.
+void DrawCO2Graph(FrameBuffer &fb, const std::deque<CO2Sample> &history) {
+  constexpr int kLabelY = 178;
+  constexpr int kGraphY0 = 188;
+  constexpr int kGraphY1 = 236;
+  constexpr int kMarginX = 4;
+
+  fb.DrawTextCentered(kLabelY, "CO2 1H", Color{140, 140, 140}, 1);
+
+  const int x0 = kMarginX;
+  const int width = fb.xres() - 2 * kMarginX;
+  const int graph_h = kGraphY1 - kGraphY0;
+  fb.FillRect(x0, kGraphY0, width, graph_h, Color{25, 25, 25});
+  if (width <= 0) {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+  std::array<double, kGraphBuckets> sum{};
+  std::array<int, kGraphBuckets> count{};
+  for (const auto &s : history) {
+    const double age_s = std::chrono::duration<double>(now - s.time).count();
+    if (age_s < 0.0 || age_s > std::chrono::duration<double>(kHistoryWindow).count()) {
+      continue;
+    }
+    const int bucket_from_right = static_cast<int>(age_s / 60.0);
+    const int idx = kGraphBuckets - 1 - bucket_from_right;
+    if (idx < 0 || idx >= kGraphBuckets) {
+      continue;
+    }
+    sum[idx] += s.co2_ppm;
+    count[idx] += 1;
+  }
+
+  double min_v = std::numeric_limits<double>::infinity();
+  double max_v = -std::numeric_limits<double>::infinity();
+  std::array<double, kGraphBuckets> value{};
+  std::array<bool, kGraphBuckets> has{};
+  bool any = false;
+  for (int i = 0; i < kGraphBuckets; ++i) {
+    if (count[i] == 0) {
+      has[i] = false;
+      continue;
+    }
+    value[i] = sum[i] / count[i];
+    has[i] = true;
+    any = true;
+    min_v = std::min(min_v, value[i]);
+    max_v = std::max(max_v, value[i]);
+  }
+  if (!any) {
+    return;
+  }
+  if (max_v - min_v < 100.0) {
+    const double mid = (max_v + min_v) / 2.0;
+    min_v = mid - 50.0;
+    max_v = mid + 50.0;
+  }
+
+  const double step = static_cast<double>(width) / kGraphBuckets;
+  for (int i = 0; i < kGraphBuckets; ++i) {
+    if (!has[i]) {
+      continue;
+    }
+    const int x = x0 + static_cast<int>(i * step);
+    const int x_next = x0 + static_cast<int>((i + 1) * step);
+    const int bar_w = std::max(1, x_next - x - 1);
+    const double frac = (value[i] - min_v) / (max_v - min_v);
+    const int bar_h = std::clamp(static_cast<int>(frac * graph_h + 0.5), 1, graph_h);
+    fb.FillRect(x, kGraphY1 - bar_h, bar_w, bar_h, StatusColor(value[i]));
+  }
+}
+
+void Render(FrameBuffer &fb, const Reading *reading, const char *error,
+            const std::deque<CO2Sample> &history) {
   fb.Clear(kBlack);
   fb.DrawTextCentered(6, "AEROLITH", kWhite, 2);
 
@@ -90,6 +181,8 @@ void Render(FrameBuffer &fb, const Reading *reading, const char *error) {
   char hum_buf[32];
   std::snprintf(hum_buf, sizeof(hum_buf), "HUM %.0f%%", reading->humidity_rh);
   fb.DrawTextCentered(160, hum_buf, kWhite, 2);
+
+  DrawCO2Graph(fb, history);
 
   fb.Flush();
 }
@@ -189,16 +282,24 @@ int main(int argc, char **argv) {
   FrameBuffer fb(args.fb);
   TouchInput touch(args.touch_path);
 
+  // last_reading is the last *successful* reading and is never cleared on a
+  // failed read -- only overwritten by the next success. Staleness is
+  // judged from last_reading_time instead, so a transient read failure
+  // keeps showing the old value rather than flipping to an error screen.
   std::optional<Reading> last_reading;
+  std::chrono::steady_clock::time_point last_reading_time;
   std::string last_error;
+  std::deque<CO2Sample> co2_history;
   PomodoroState pomo_state = PomodoroState::kIdle;
   std::chrono::steady_clock::time_point pomo_deadline;
   long last_rendered_pomo_seconds = -1;
 
   auto RenderCurrent = [&] {
     if (pomo_state == PomodoroState::kIdle) {
-      Render(fb, last_reading ? &*last_reading : nullptr,
-             last_reading ? nullptr : last_error.c_str());
+      const bool stale = !last_reading.has_value() ||
+                          std::chrono::steady_clock::now() - last_reading_time > kStaleGracePeriod;
+      Render(fb, stale ? nullptr : &*last_reading, stale ? last_error.c_str() : nullptr,
+             co2_history);
       return;
     }
     const auto remaining = pomo_state == PomodoroState::kRunning
@@ -211,15 +312,26 @@ int main(int argc, char **argv) {
   auto ReadSensor = [&] {
     try {
       last_reading = sensor.Read();
+      last_reading_time = std::chrono::steady_clock::now();
       last_error.clear();
     } catch (const std::exception &exc) {
       std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
-      last_reading.reset();
       last_error = exc.what();
     }
   };
 
+  auto RecordHistory = [&] {
+    const auto now = std::chrono::steady_clock::now();
+    if (last_reading) {
+      co2_history.push_back({now, last_reading->co2_ppm});
+    }
+    while (!co2_history.empty() && now - co2_history.front().time > kHistoryWindow) {
+      co2_history.pop_front();
+    }
+  };
+
   ReadSensor();
+  RecordHistory();
   RenderCurrent();
 
   if (args.once) {
@@ -235,6 +347,7 @@ int main(int argc, char **argv) {
   // communicate through reading_mutex-guarded state below.
   std::mutex reading_mutex;
   std::optional<Reading> shared_reading = last_reading;
+  std::chrono::steady_clock::time_point shared_reading_time = last_reading_time;
   std::string shared_error = last_error;
   std::atomic<bool> reading_dirty{false};
 
@@ -246,18 +359,18 @@ int main(int argc, char **argv) {
       if (!g_running) {
         break;
       }
-      std::optional<Reading> reading;
-      std::string error;
+      // On failure, shared_reading/shared_reading_time are left untouched so
+      // the last successful reading survives a transient error.
       try {
-        reading = sensor.Read();
-      } catch (const std::exception &exc) {
-        std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
-        error = exc.what();
-      }
-      {
+        Reading reading = sensor.Read();
         std::lock_guard<std::mutex> lock(reading_mutex);
         shared_reading = reading;
-        shared_error = error;
+        shared_reading_time = std::chrono::steady_clock::now();
+        shared_error.clear();
+      } catch (const std::exception &exc) {
+        std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
+        std::lock_guard<std::mutex> lock(reading_mutex);
+        shared_error = exc.what();
       }
       reading_dirty = true;
     }
@@ -289,10 +402,17 @@ int main(int argc, char **argv) {
     }
 
     if (reading_dirty.exchange(false)) {
+      const auto previous_reading_time = last_reading_time;
       {
         std::lock_guard<std::mutex> lock(reading_mutex);
         last_reading = shared_reading;
+        last_reading_time = shared_reading_time;
         last_error = shared_error;
+      }
+      // Only a genuinely fresh reading (not a re-affirmed stale one) belongs
+      // in the CO2 history graph.
+      if (last_reading_time != previous_reading_time) {
+        RecordHistory();
       }
       if (pomo_state == PomodoroState::kIdle) {
         RenderCurrent();
