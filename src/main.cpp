@@ -18,8 +18,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -40,8 +43,69 @@ using aerolith::TouchInput;
 constexpr Color kWhite{255, 255, 255};
 constexpr Color kBlack{0, 0, 0};
 
-enum class PomodoroState { kIdle, kRunning, kFinished };
+enum class PomodoroState { kIdle, kRunning, kPaused, kFinished };
+enum class PomodoroPhase { kWork, kBreak };
+// Which screen is currently on the display, independent of Pomodoro state:
+// a session keeps running/counting down in the background regardless of
+// which screen is visible, and a swipe just changes what's visible.
+enum class Screen { kSensor, kPomodoro };
 constexpr auto kPomodoroDuration = std::chrono::minutes(25);
+constexpr auto kBreakDuration = std::chrono::minutes(5);
+
+// Daily Pomodoro stats, kept in memory and mirrored to kStatsPath so a
+// restart (or a power cycle overnight) doesn't lose today's count. Rolls
+// over automatically the first time it's touched on a new calendar day.
+constexpr const char *kStatsPath = "/var/lib/aerolith/pomodoro_stats";
+
+std::string TodayDateString() {
+  const std::time_t t = std::time(nullptr);
+  std::tm tm{};
+  ::localtime_r(&t, &tm);
+  char buf[32];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+  return buf;
+}
+
+struct DailyStats {
+  std::string date = TodayDateString();
+  int sessions = 0;
+  int minutes = 0;
+};
+
+DailyStats LoadStats(const std::string &path) {
+  DailyStats stats;
+  std::ifstream f(path);
+  std::string date;
+  int sessions = 0, minutes = 0;
+  if (f && (f >> date >> sessions >> minutes) && date == stats.date) {
+    stats.sessions = sessions;
+    stats.minutes = minutes;
+  }
+  return stats;
+}
+
+void SaveStats(const std::string &path, const DailyStats &stats) {
+  std::error_code ec;
+  std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+  std::ofstream f(path, std::ios::trunc);
+  if (f) {
+    f << stats.date << ' ' << stats.sessions << ' ' << stats.minutes << '\n';
+  }
+}
+
+// Rolls the in-memory stats over to today if the date has changed (e.g.
+// the app has been running since before midnight). No-op, no write, if
+// already current.
+void RollStatsIfNewDay(DailyStats *stats, const std::string &path) {
+  const std::string today = TodayDateString();
+  if (stats->date == today) {
+    return;
+  }
+  stats->date = today;
+  stats->sessions = 0;
+  stats->minutes = 0;
+  SaveStats(path, *stats);
+}
 
 // A transient sensor read failure (I2C hiccup, single-shot measurement
 // glitch) shouldn't flip the whole screen to an error state -- keep showing
@@ -192,22 +256,55 @@ void Render(FrameBuffer &fb, const Reading *reading, const char *error,
   fb.Flush();
 }
 
-void RenderPomodoro(FrameBuffer &fb, PomodoroState state, std::chrono::seconds remaining) {
-  fb.Clear(kBlack);
-  fb.DrawTextCentered(6, "POMODORO", kWhite, 2);
+void DrawDailyStats(FrameBuffer &fb, int y, const DailyStats &stats) {
+  char buf[40];
+  std::snprintf(buf, sizeof(buf), "TODAY %d SESSIONS  %d MIN", stats.sessions, stats.minutes);
+  fb.DrawTextCentered(y, buf, Color{170, 170, 170}, 1);
+}
 
-  if (state == PomodoroState::kFinished) {
-    fb.FillRect(0, 30, fb.xres(), 90, Color{150, 20, 20});
-    fb.DrawTextCentered(45, "DONE", kWhite, 6);
+void RenderPomodoro(FrameBuffer &fb, PomodoroState state, PomodoroPhase phase,
+                     std::chrono::seconds remaining, const DailyStats &stats) {
+  fb.Clear(kBlack);
+  fb.DrawTextCentered(6, phase == PomodoroPhase::kBreak ? "BREAK" : "POMODORO", kWhite, 2);
+
+  if (state == PomodoroState::kIdle) {
+    fb.FillRect(0, 30, fb.xres(), 90, Color{190, 70, 30});
+    char buf[16];
+    const auto mins = std::chrono::duration_cast<std::chrono::minutes>(kPomodoroDuration).count();
+    std::snprintf(buf, sizeof(buf), "%02d:00", static_cast<int>(mins));
+    fb.DrawTextCentered(45, buf, kWhite, 6);
+    fb.DrawTextCentered(135, "HOLD CENTER TO START", Color{170, 170, 170}, 1);
+    DrawDailyStats(fb, 155, stats);
+    fb.DrawTextCentered(175, "HOLD CORNER TO RESET", Color{100, 100, 100}, 1);
     fb.Flush();
     return;
   }
 
-  fb.FillRect(0, 30, fb.xres(), 90, Color{190, 70, 30});
+  if (state == PomodoroState::kFinished) {
+    fb.FillRect(0, 30, fb.xres(), 90, Color{150, 20, 20});
+    fb.DrawTextCentered(45, "DONE", kWhite, 6);
+    fb.DrawTextCentered(
+        135, phase == PomodoroPhase::kWork ? "HOLD FOR BREAK" : "HOLD FOR NEXT", Color{170, 170, 170}, 1);
+    DrawDailyStats(fb, 155, stats);
+    fb.Flush();
+    return;
+  }
+
+  // Running or Paused -- same layout, just a dimmer band and different
+  // hints while paused so the frozen time doesn't read as a live countdown.
+  const bool paused = state == PomodoroState::kPaused;
+  const Color band = paused ? Color{90, 90, 90}
+                             : phase == PomodoroPhase::kBreak ? Color{30, 110, 170}
+                                                               : Color{190, 70, 30};
+  fb.FillRect(0, 30, fb.xres(), 90, band);
   const int total_seconds = static_cast<int>(std::max<long>(remaining.count(), 0) % 3600);
   char buf[16];
   std::snprintf(buf, sizeof(buf), "%02d:%02d", total_seconds / 60, total_seconds % 60);
   fb.DrawTextCentered(45, buf, kWhite, 6);
+  fb.DrawTextCentered(135, paused ? "PAUSED - TAP TO RESUME" : "TAP TO PAUSE", Color{170, 170, 170},
+                       1);
+  DrawDailyStats(fb, 155, stats);
+  fb.DrawTextCentered(175, "HOLD TO STOP", Color{100, 100, 100}, 1);
   fb.Flush();
 }
 
@@ -215,6 +312,7 @@ struct Args {
   std::string fb = "/dev/fb0";
   std::string iio_path;
   std::string touch_path = "/dev/input/event0";
+  std::string stats_path = kStatsPath;
   double interval = 5.0;
   bool once = false;
 };
@@ -222,17 +320,30 @@ struct Args {
 void PrintUsage(const char *prog) {
   std::printf(
       "Usage: %s [--fb DEV] [--iio-path PATH] [--touch-path PATH] "
-      "[--interval SECONDS] [--once]\n"
+      "[--stats-path PATH] [--interval SECONDS] [--once]\n"
       "\n"
       "  --fb DEV            framebuffer device (default: /dev/fb0)\n"
       "  --iio-path PATH     explicit /sys/bus/iio/devices/iio:deviceN path\n"
-      "                      (auto-detected by driver name otherwise)\n"
+      "                      (auto-detected by driver name otherwise); if no\n"
+      "                      SCD41 is found at startup, the display falls back\n"
+      "                      to the Pomodoro screen instead of a CO2 readout\n"
+      "  --stats-path PATH   where daily Pomodoro stats are persisted\n"
+      "                      (default: %s)\n"
       "  --touch-path PATH   touchscreen evdev node (default: /dev/input/event0);\n"
-      "                      a short tap near the center rotates the display,\n"
-      "                      a long press starts/cancels a 25-minute Pomodoro timer\n"
+      "                      three quick taps near the center rotate the display\n"
+      "                      (a single tap doesn't -- too easy to trigger by\n"
+      "                      accident -- except on the Pomodoro screen during a\n"
+      "                      session, where a single tap pauses/resumes it), a\n"
+      "                      left/right swipe switches between the CO2 and\n"
+      "                      Pomodoro screens, a long press near the center\n"
+      "                      starts a Pomodoro work session, stops the current\n"
+      "                      one (with a reset), or advances to the next phase\n"
+      "                      once one finishes, and a longer press held in the\n"
+      "                      bottom-left corner resets today's Pomodoro stats\n"
+      "                      (only while idle on the Pomodoro screen)\n"
       "  --interval SECONDS  seconds between reads (default: 5.0)\n"
       "  --once              read and render a single frame, then exit\n",
-      prog);
+      prog, kStatsPath);
 }
 
 bool ParseArgs(int argc, char **argv, Args *args) {
@@ -251,6 +362,8 @@ bool ParseArgs(int argc, char **argv, Args *args) {
       args->iio_path = next_value("--iio-path");
     } else if (arg == "--touch-path") {
       args->touch_path = next_value("--touch-path");
+    } else if (arg == "--stats-path") {
+      args->stats_path = next_value("--stats-path");
     } else if (arg == "--interval") {
       args->interval = std::atof(next_value("--interval"));
     } else if (arg == "--once") {
@@ -282,7 +395,19 @@ int main(int argc, char **argv) {
   std::signal(SIGTERM, HandleStop);
   std::signal(SIGINT, HandleStop);
 
-  SCD41 sensor(args.iio_path);
+  // If no SCD41 is wired up (or the kernel hasn't detected one), there's
+  // nothing meaningful to show on the CO2 screen -- fall back to the
+  // Pomodoro screen as the default view instead of a permanent error
+  // display.
+  std::optional<SCD41> sensor;
+  bool sensor_present = true;
+  try {
+    sensor.emplace(args.iio_path);
+  } catch (const std::exception &exc) {
+    std::fprintf(stderr, "aerolith: no CO2 sensor detected, defaulting to Pomodoro: %s\n",
+                 exc.what());
+    sensor_present = false;
+  }
 
   FrameBuffer fb(args.fb);
   TouchInput touch(args.touch_path);
@@ -296,12 +421,20 @@ int main(int argc, char **argv) {
   std::string last_error;
   std::deque<CO2Sample> co2_history;
   PomodoroState pomo_state = PomodoroState::kIdle;
+  PomodoroPhase pomo_phase = PomodoroPhase::kWork;
   std::chrono::steady_clock::time_point pomo_deadline;
+  // Frozen remaining time as of the moment a running session was paused;
+  // resuming re-derives a fresh pomo_deadline from this instead of the
+  // (by-then meaningless) old deadline.
+  std::chrono::seconds pomo_paused_remaining{0};
   long last_rendered_pomo_seconds = -1;
   bool brightness_dragging = false;
+  DailyStats stats = LoadStats(args.stats_path);
+  Screen current_screen = sensor_present ? Screen::kSensor : Screen::kPomodoro;
 
   auto RenderCurrent = [&] {
-    if (pomo_state == PomodoroState::kIdle) {
+    RollStatsIfNewDay(&stats, args.stats_path);
+    if (current_screen == Screen::kSensor && sensor_present) {
       const bool stale = !last_reading.has_value() ||
                           std::chrono::steady_clock::now() - last_reading_time > kStaleGracePeriod;
       Render(fb, stale ? nullptr : &*last_reading, stale ? last_error.c_str() : nullptr,
@@ -311,13 +444,17 @@ int main(int argc, char **argv) {
     const auto remaining = pomo_state == PomodoroState::kRunning
                                 ? std::chrono::duration_cast<std::chrono::seconds>(
                                       pomo_deadline - std::chrono::steady_clock::now())
-                                : std::chrono::seconds(0);
-    RenderPomodoro(fb, pomo_state, remaining);
+                            : pomo_state == PomodoroState::kPaused ? pomo_paused_remaining
+                                                                    : std::chrono::seconds(0);
+    RenderPomodoro(fb, pomo_state, pomo_phase, remaining, stats);
   };
 
   auto ReadSensor = [&] {
+    if (!sensor_present) {
+      return;
+    }
     try {
-      last_reading = sensor.Read();
+      last_reading = sensor->Read();
       last_reading_time = std::chrono::steady_clock::now();
       last_error.clear();
     } catch (const std::exception &exc) {
@@ -357,30 +494,33 @@ int main(int argc, char **argv) {
   std::string shared_error = last_error;
   std::atomic<bool> reading_dirty{false};
 
-  std::thread sensor_thread([&] {
-    while (g_running) {
-      for (int i = 0; i < static_cast<int>(args.interval * 10) && g_running; ++i) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  std::thread sensor_thread;
+  if (sensor_present) {
+    sensor_thread = std::thread([&] {
+      while (g_running) {
+        for (int i = 0; i < static_cast<int>(args.interval * 10) && g_running; ++i) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        if (!g_running) {
+          break;
+        }
+        // On failure, shared_reading/shared_reading_time are left untouched
+        // so the last successful reading survives a transient error.
+        try {
+          Reading reading = sensor->Read();
+          std::lock_guard<std::mutex> lock(reading_mutex);
+          shared_reading = reading;
+          shared_reading_time = std::chrono::steady_clock::now();
+          shared_error.clear();
+        } catch (const std::exception &exc) {
+          std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
+          std::lock_guard<std::mutex> lock(reading_mutex);
+          shared_error = exc.what();
+        }
+        reading_dirty = true;
       }
-      if (!g_running) {
-        break;
-      }
-      // On failure, shared_reading/shared_reading_time are left untouched so
-      // the last successful reading survives a transient error.
-      try {
-        Reading reading = sensor.Read();
-        std::lock_guard<std::mutex> lock(reading_mutex);
-        shared_reading = reading;
-        shared_reading_time = std::chrono::steady_clock::now();
-        shared_error.clear();
-      } catch (const std::exception &exc) {
-        std::fprintf(stderr, "aerolith: sensor read failed: %s\n", exc.what());
-        std::lock_guard<std::mutex> lock(reading_mutex);
-        shared_error = exc.what();
-      }
-      reading_dirty = true;
-    }
-  });
+    });
+  }
 
   while (g_running) {
     if (touch.valid()) {
@@ -388,17 +528,80 @@ int main(int argc, char **argv) {
       poll(&pfd, 1, 100);
       switch (touch.Poll()) {
         case TouchEvent::kShortTap:
+          // A tap no longer rotates -- that was too easy to trigger by
+          // accident. On the Pomodoro screen, a tap during a session still
+          // pauses/resumes it.
+          if (current_screen == Screen::kPomodoro && pomo_state == PomodoroState::kRunning) {
+            pomo_paused_remaining = std::max(
+                std::chrono::seconds(0), std::chrono::duration_cast<std::chrono::seconds>(
+                                              pomo_deadline - std::chrono::steady_clock::now()));
+            pomo_state = PomodoroState::kPaused;
+            last_rendered_pomo_seconds = -1;
+            RenderCurrent();
+          } else if (current_screen == Screen::kPomodoro && pomo_state == PomodoroState::kPaused) {
+            pomo_deadline = std::chrono::steady_clock::now() + pomo_paused_remaining;
+            pomo_state = PomodoroState::kRunning;
+            last_rendered_pomo_seconds = -1;
+            RenderCurrent();
+          }
+          break;
+        case TouchEvent::kTripleTap:
           fb.SetRotation(NextRotation(fb.rotation()));
           RenderCurrent();
           break;
         case TouchEvent::kLongPress:
-          pomo_state = pomo_state == PomodoroState::kIdle ? PomodoroState::kRunning
-                                                            : PomodoroState::kIdle;
-          if (pomo_state == PomodoroState::kRunning) {
-            pomo_deadline = std::chrono::steady_clock::now() + kPomodoroDuration;
+          switch (pomo_state) {
+            case PomodoroState::kIdle:
+              // Start a work session.
+              pomo_state = PomodoroState::kRunning;
+              pomo_phase = PomodoroPhase::kWork;
+              pomo_deadline = std::chrono::steady_clock::now() + kPomodoroDuration;
+              break;
+            case PomodoroState::kRunning:
+            case PomodoroState::kPaused:
+              // Stop: discard all progress on the current session/break, back
+              // to idle ready to start a fresh one.
+              pomo_state = PomodoroState::kIdle;
+              pomo_phase = PomodoroPhase::kWork;
+              break;
+            case PomodoroState::kFinished:
+              if (pomo_phase == PomodoroPhase::kWork) {
+                // Work session done -- start the break.
+                pomo_phase = PomodoroPhase::kBreak;
+                pomo_state = PomodoroState::kRunning;
+                pomo_deadline = std::chrono::steady_clock::now() + kBreakDuration;
+              } else {
+                // Break done -- back to idle, ready for the next session.
+                pomo_phase = PomodoroPhase::kWork;
+                pomo_state = PomodoroState::kIdle;
+              }
+              break;
           }
+          // Surface the result of the gesture even if the sensor screen was
+          // showing -- the session keeps running/counting down regardless of
+          // which screen is visible, but the user should see what they just did.
+          current_screen = Screen::kPomodoro;
           last_rendered_pomo_seconds = -1;
           RenderCurrent();
+          break;
+        case TouchEvent::kCornerLongPress:
+          // Destructive, so only honored from the idle Pomodoro screen
+          // (not mid-session, and not blindly from the sensor screen).
+          if (pomo_state == PomodoroState::kIdle && current_screen == Screen::kPomodoro) {
+            stats = DailyStats{};
+            SaveStats(args.stats_path, stats);
+            RenderCurrent();
+          }
+          break;
+        case TouchEvent::kSwipeLeft:
+        case TouchEvent::kSwipeRight:
+          // Only one screen exists without a sensor, so there's nothing to
+          // swipe to.
+          if (sensor_present) {
+            current_screen =
+                current_screen == Screen::kSensor ? Screen::kPomodoro : Screen::kSensor;
+            RenderCurrent();
+          }
           break;
         case TouchEvent::kNone:
           break;
@@ -450,7 +653,7 @@ int main(int argc, char **argv) {
       if (last_reading_time != previous_reading_time) {
         RecordHistory();
       }
-      if (pomo_state == PomodoroState::kIdle) {
+      if (current_screen == Screen::kSensor) {
         RenderCurrent();
       }
     }
@@ -460,16 +663,33 @@ int main(int argc, char **argv) {
           pomo_deadline - std::chrono::steady_clock::now());
       if (remaining.count() <= 0) {
         pomo_state = PomodoroState::kFinished;
+        if (pomo_phase == PomodoroPhase::kWork) {
+          RollStatsIfNewDay(&stats, args.stats_path);
+          stats.sessions += 1;
+          stats.minutes +=
+              static_cast<int>(std::chrono::duration_cast<std::chrono::minutes>(kPomodoroDuration).count());
+          SaveStats(args.stats_path, stats);
+        }
+        // Alert the user even if they're currently looking at the sensor
+        // screen -- a finished session (or break) is worth surfacing.
+        current_screen = Screen::kPomodoro;
         last_rendered_pomo_seconds = -1;
         RenderCurrent();
       } else if (remaining.count() != last_rendered_pomo_seconds) {
         last_rendered_pomo_seconds = remaining.count();
-        RenderCurrent();
+        // Bookkeeping happens every tick regardless of visibility so the
+        // Pomodoro screen shows the exact remaining time the moment the
+        // user swipes back to it; the redraw itself is skipped otherwise.
+        if (current_screen == Screen::kPomodoro) {
+          RenderCurrent();
+        }
       }
     }
   }
 
-  sensor_thread.join();
+  if (sensor_thread.joinable()) {
+    sensor_thread.join();
+  }
 
   fb.Clear(kBlack);
   fb.Flush();

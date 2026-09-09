@@ -49,7 +49,7 @@ include/aerolith/
   scd41.hpp         # IIO sysfs -> Reading{co2_ppm, temperature_c, humidity_rh}
   framebuffer.hpp   # /dev/fb0 access + 5x7 text/rect drawing + rotation
   font5x7.hpp       # hand-drawn bitmap font
-  touch.hpp         # evdev touchscreen -> short-tap-in-center detection
+  touch.hpp         # evdev touchscreen -> tap/triple-tap/long-press/corner/swipe gesture detection
 src/                # matching .cpp implementations + main.cpp (CLI entry point)
 cmake/toolchain-riscv64-m1s.cmake
 buildroot/
@@ -96,22 +96,82 @@ ssh root@<board-ip> /usr/bin/aerolith --once   # single frame, to try it
 ```
 
 Flags: `--fb DEV` (default `/dev/fb0`), `--iio-path PATH` (auto-detected
-otherwise), `--touch-path PATH` (default `/dev/input/event0`), `--interval
-SECONDS` (default 5), `--once` (render a single frame and exit).
+otherwise), `--touch-path PATH` (default `/dev/input/event0`), `--stats-path
+PATH` (default `/var/lib/aerolith/pomodoro_stats`), `--interval SECONDS`
+(default 5), `--once` (render a single frame and exit).
 
-### Rotating the display via touch
+### Rotating the display via a triple tap
 
 The board's onboard CST816x touchscreen (`/dev/input/event0`) is polled
-continuously: a short tap (pressed and released within 400ms, without
-dragging) near the center of the touch surface rotates the display 90°
-clockwise, cycling 0° -> 90° -> 180° -> 270° -> 0° ... Rendering is done
-in a logical coordinate space that swaps width/height at 90°/270° and is
-then mapped onto the panel's fixed physical pixel layout
-(`FrameBuffer::SetRotation`/`Rotation` in
+continuously. Rotation is triggered by three short taps near the center in
+quick succession, cycling the display 0° -> 90° -> 180° -> 270° -> 0° ...
+A single tap deliberately does *not* rotate the display (it was too easy
+to trigger by accident, and an earlier "trace a circle" gesture that
+replaced it turned out unreliable in practice); the single tap is instead
+reserved for pausing/resuming a Pomodoro session (see below).
+
+A completed tap doesn't fire right away -- `TouchInput::Poll` in
+[touch.cpp](src/touch.cpp) holds it for a short window (350ms) to see
+whether another tap follows. A third tap within that window fires the
+rotation immediately; letting the window lapse with only one (or two, which
+has no meaning of its own) pending tap resolves it as a plain tap instead.
+That short hold is the trade-off for a triple tap being distinguishable
+from three separate plain taps at all -- pausing/resuming a running
+Pomodoro session via tap is very slightly delayed for the same reason.
+
+Rendering is done in a logical coordinate space that swaps width/height
+at 90°/270° and is then mapped onto the panel's fixed physical pixel
+layout (`FrameBuffer::SetRotation`/`Rotation` in
 [framebuffer.hpp](include/aerolith/framebuffer.hpp)), so drawing code
 doesn't need to know about the current orientation. If no touch device is
 present (or `--touch-path` points at nothing), this feature is silently
 unavailable and the app otherwise runs as normal.
+
+### Switching screens via swipe
+
+When a sensor is present, a quick left or right swipe (released within
+600ms, moving at least a quarter of the panel's width, staying roughly
+horizontal) toggles the display between the CO2 screen and the Pomodoro
+screen. A Pomodoro session keeps running in the background regardless of
+which screen is currently showing -- swiping away from it doesn't pause
+the countdown, and the app automatically swipes back to the Pomodoro
+screen when a session or break finishes so the alert isn't missed. A
+swipe starting in the brightness slider's edge strip or the stats-reset
+corner defers to that gesture instead. Like the rotation triple tap, swipe
+recognition isn't itself rotation-aware -- it's measured in the panel's
+fixed physical coordinate space.
+
+### Pomodoro screen
+
+If no SCD41 is detected at startup (`FindScd4xDevice` finds nothing under
+`/sys/bus/iio/devices`), there's no CO2 reading to show, so the app falls
+back to the Pomodoro screen as its default (and only) view instead of a
+permanent "SENSOR ERROR" display. When a sensor *is* present, reach the
+Pomodoro screen either by swiping or with a long press near the center of
+the touch surface, which also starts a 25-minute work session.
+
+The Pomodoro flow includes a break, pause, and daily stats:
+
+- **Idle**: shows today's completed session count and total focused
+  minutes. A long press near the center starts a 25-minute work session.
+- **Running (work or break)**: counts down. A short tap pauses it, and a
+  long press stops it -- discarding the remaining time, back to idle ready
+  to start a fresh session (a completed work session was already logged to
+  today's stats the moment it finished, so stopping it early doesn't undo
+  that).
+- **Paused**: the countdown freezes at whatever time was left. A short tap
+  resumes it from there; a long press stops it the same as while running.
+- **Finished (work)**: the session is logged to today's stats immediately;
+  a long press starts a 5-minute break.
+- **Finished (break)**: a long press returns to idle, ready for the next
+  session.
+
+Daily stats persist across restarts at `--stats-path` (default
+`/var/lib/aerolith/pomodoro_stats`) and reset automatically at midnight.
+To reset them manually, hold a long press (about 1.5s) in the bottom-left
+corner of the touch surface while the Pomodoro screen is idle -- kept as a
+separate, out-of-the-way gesture (and disabled outside the idle screen)
+since it's destructive.
 
 To auto-start at boot without a full package build, install the init
 script directly:

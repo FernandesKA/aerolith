@@ -1,7 +1,13 @@
 // Watches a Linux evdev touchscreen node (the board's CST816x single-touch
-// panel, normally /dev/input/event0) and recognizes two gestures near the
-// center of the touch surface: a short tap (pressed and released quickly,
-// without dragging) and a long press (held in place past a threshold).
+// panel, normally /dev/input/event0) and recognizes gestures: near the
+// center of the touch surface, a short tap (pressed and released quickly,
+// without dragging), three of those in quick succession recognized as a
+// separate "triple tap" gesture instead, and a long press (held in place
+// past a threshold); in the bottom-left corner of the panel (physical
+// space, not rotation-aware -- like the brightness slider), a longer hold
+// recognized as a separate "corner long press" gesture; and, from any
+// other starting point, a quick horizontal drag recognized as a left/right
+// swipe.
 #pragma once
 
 #include <chrono>
@@ -10,7 +16,15 @@
 
 namespace aerolith {
 
-enum class TouchEvent { kNone, kShortTap, kLongPress };
+enum class TouchEvent {
+  kNone,
+  kShortTap,
+  kTripleTap,
+  kLongPress,
+  kCornerLongPress,
+  kSwipeLeft,
+  kSwipeRight,
+};
 
 class TouchInput {
 public:
@@ -50,10 +64,34 @@ private:
   bool touching_ = false;
   bool in_center_ = false;
   bool long_press_fired_ = false;
+  bool in_corner_ = false;
+  bool corner_long_press_fired_ = false;
+  // Swipes are measured from where the touch started, and disallowed
+  // entirely if it started somewhere another gesture already owns (the
+  // brightness slider's right-edge strip, or the corner reset zone) so a
+  // drag through those can't also register as a screen swipe.
+  int32_t down_x_ = 0, down_y_ = 0;
+  bool swipe_disallowed_ = false;
   int32_t cur_x_ = 0, cur_y_ = 0;
   std::chrono::steady_clock::time_point down_time_;
 
+  // Triple-tap counting: a completed tap doesn't fire kShortTap right away
+  // -- it waits briefly to see whether more taps follow within the gap
+  // window. Two taps in that window keeps waiting; a third fires
+  // kTripleTap immediately; letting the window lapse with only one or two
+  // taps pending resolves to kShortTap (two are just treated as one, there
+  // being no separate meaning for a double tap).
+  int pending_taps_ = 0;
+  std::chrono::steady_clock::time_point last_tap_time_;
+
   bool InCenterZone(int32_t x, int32_t y) const;
+  // Bottom-left corner of the panel's physical coordinate space, used for
+  // the (destructive, so deliberately out-of-the-way) stats reset gesture.
+  bool InCornerZone(int32_t x, int32_t y) const;
+  // Rightmost slice of the panel, matching main.cpp's brightness slider
+  // zone -- kept in sync by convention, not by shared code, since
+  // TouchInput otherwise has no notion of what a caller does with drags.
+  bool InRightEdgeZone(int32_t x, int32_t y) const;
 };
 
 } // namespace aerolith
